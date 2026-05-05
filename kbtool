@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+CHUNK_SIZE="${KBTOOL_CHUNK_SIZE:-3M}"
+_KB_RETRY_MAX="${KBTOOL_RETRIES:-20}"
+
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
+
+log_error() { echo -e "${RED}✗${NC} $*" >&2; }
+log_info()  { echo -e "${CYAN}→${NC} $*" >&2; }
+log_warn()  { echo -e "${YELLOW}!${NC} $*" >&2; }
+log_ok()    { echo -e "${GREEN}✓${NC} $*" >&2; }
+
+check_deps() {
+    if ! command -v kubectl &>/dev/null; then
+        log_error "kubectl not found in PATH"
+        exit 1
+    fi
+}
+
+resolve_pod() {
+    local namespace="$1" query="$2"
+    local pods
+    pods=$(kubectl get pods -n "$namespace" \
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null) || true
+
+    if [[ -z "$pods" ]]; then
+        log_error "No pods found in namespace '${namespace}'"
+        return 1
+    fi
+
+    local pod
+    for pod in $pods; do
+        if [[ "$pod" == "$query" ]]; then
+            echo "$pod"
+            return 0
+        fi
+    done
+
+    local matches=()
+    for pod in $pods; do
+        if [[ "$pod" == *"$query"* ]]; then
+            matches+=("$pod")
+        fi
+    done
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        log_error "No pod matching '${query}' in namespace '${namespace}'"
+        echo -e "${DIM}Available pods:${NC}" >&2
+        for pod in $pods; do echo "  $pod" >&2; done
+        return 1
+    fi
+
+    if [[ ${#matches[@]} -eq 1 ]]; then
+        log_info "Pod: ${matches[0]}"
+        echo "${matches[0]}"
+        return 0
+    fi
+
+    echo -e "${BOLD}Multiple pods match '${query}':${NC}" >&2
+    local i
+    for i in "${!matches[@]}"; do
+        echo "  $((i+1))) ${matches[$i]}" >&2
+    done
+    echo -n "Select [1-${#matches[@]}]: " >&2
+    read -r choice < /dev/tty
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
+        echo "${matches[$((choice-1))]}"
+        return 0
+    fi
+    log_error "Invalid selection"
+    return 1
+}
+
+resolve_container() {
+    local namespace="$1" pod="$2"
+    local containers
+    containers=$(kubectl get pod "$pod" -n "$namespace" \
+        -o jsonpath='{.spec.containers[*].name}' 2>/dev/null) || true
+
+    local arr=()
+    local c
+    for c in $containers; do arr+=("$c"); done
+
+    if [[ ${#arr[@]} -eq 0 ]]; then
+        log_error "No containers found in pod '${pod}'"
+        return 1
+    fi
+
+    if [[ ${#arr[@]} -eq 1 ]]; then
+        echo "${arr[0]}"
+        return 0
+    fi
+
+    echo -e "${BOLD}Multiple containers in '${pod}':${NC}" >&2
+    local i
+    for i in "${!arr[@]}"; do
+        echo "  $((i+1))) ${arr[$i]}" >&2
+    done
+    echo -n "Select [1-${#arr[@]}] (Enter=1): " >&2
+    read -r choice < /dev/tty
+
+    if [[ -z "$choice" ]]; then choice=1; fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#arr[@]} )); then
+        echo "${arr[$((choice-1))]}"
+        return 0
+    fi
+
+    for c in "${arr[@]}"; do
+        if [[ "$c" == *"$choice"* ]]; then
+            echo "$c"
+            return 0
+        fi
+    done
+
+    log_error "Invalid selection"
+    return 1
+}
+
+get_env() {
+    local namespace="$1" pod="$2" container="$3" var="$4"
+    local val
+    val=$(kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- printenv "$var" 2>/dev/null) || true
+    echo "$val"
+}
+
+escape_shell() {
+    local s="$1"
+    s="${s//\'/\'\\\'\'}"
+    echo "$s"
+}
+
+format_eta() {
+    local secs="$1"
+    if [[ "$secs" -lt 0 ]]; then secs=0; fi
+    local h=$((secs / 3600)) m=$(( (secs % 3600) / 60 )) s=$((secs % 60))
+    if [[ "$h" -gt 0 ]]; then
+        printf "%dh%02dm%02ds" "$h" "$m" "$s"
+    elif [[ "$m" -gt 0 ]]; then
+        printf "%dm%02ds" "$m" "$s"
+    else
+        printf "%ds" "$s"
+    fi
+}
+
+progress_bar() {
+    local current="$1" total="$2" width=30
+    local elapsed="$3"
+    local pct=$(( current * 100 / (total > 0 ? total : 1) ))
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    local bar=""
+    local i
+    for (( i=0; i<filled; i++ )); do bar+="█"; done
+    for (( i=0; i<empty; i++ )); do bar+="░"; done
+
+    local size_cur size_tot eta_str
+    size_cur="$(numfmt --to=iec "$current" 2>/dev/null || echo "${current}B")"
+    size_tot="$(numfmt --to=iec "$total" 2>/dev/null || echo "${total}B")"
+
+    local eta=""
+    if [[ "$elapsed" -gt 0 ]] && [[ "$current" -gt 0 ]] && [[ "$current" -lt "$total" ]]; then
+        local remaining=$(( (total - current) * elapsed / current ))
+        eta=" $(format_eta "$remaining")"
+    fi
+
+    printf "  [%s] %3d%% (%s/%s)%s\n" "$bar" "$pct" "$size_cur" "$size_tot" "$eta" >&2
+}
+
+_KB_START_TIME=0
+
+download_chunk() {
+    local namespace="$1" pod="$2" container="$3"
+    local remote_path="$4" local_path="$5" expected_size="$6"
+    local attempts=0
+
+    while [[ $attempts -lt $_KB_RETRY_MAX ]]; do
+        attempts=$((attempts + 1))
+        rm -f "$local_path"
+        kubectl cp --request-timeout=0 "${namespace}/${pod}:${remote_path}" "$local_path" -c "$container" 2>&1 | grep -v "Removing leading" >&2 || true
+
+        if [[ -f "$local_path" ]]; then
+            local actual_size
+            actual_size=$(stat -c%s "$local_path" 2>/dev/null || echo 0)
+            if [[ "$actual_size" -eq "$expected_size" ]]; then
+                return 0
+            fi
+            if [[ $attempts -lt $_KB_RETRY_MAX ]]; then
+                log_warn "Chunk size mismatch (got ${actual_size}, expected ${expected_size}), retry ${attempts}/${_KB_RETRY_MAX}..."
+                sleep 2
+            fi
+        else
+            if [[ $attempts -lt $_KB_RETRY_MAX ]]; then
+                log_warn "Chunk missing, retry ${attempts}/${_KB_RETRY_MAX}..."
+                sleep 2
+            fi
+        fi
+    done
+    return 1
+}
+
+upload_chunk() {
+    local namespace="$1" pod="$2" container="$3"
+    local local_path="$4" remote_path="$5"
+    local attempts=0
+
+    while [[ $attempts -lt $_KB_RETRY_MAX ]]; do
+        attempts=$((attempts + 1))
+        kubectl cp --request-timeout=0 "$local_path" "${namespace}/${pod}:${remote_path}" -c "$container" 2>&1 | grep -v "Removing leading" >&2 || true
+
+        local expected_size
+        expected_size=$(stat -c%s "$local_path" 2>/dev/null || echo 0)
+        local remote_size
+        remote_size=$(kubectl exec "$pod" -n "$namespace" -c "$container" \
+            -- sh -c "wc -c < '${remote_path}'" 2>/dev/null | tr -d ' \r') || remote_size=0
+
+        if [[ "$remote_size" -eq "$expected_size" ]]; then
+            return 0
+        fi
+        if [[ $attempts -lt $_KB_RETRY_MAX ]]; then
+            log_warn "Upload size mismatch (remote ${remote_size}, expected ${expected_size}), retry ${attempts}/${_KB_RETRY_MAX}..."
+            sleep 2
+        fi
+    done
+    return 1
+}
+
+chunk_transfer_download() {
+    local namespace="$1" pod="$2" container="$3" remote_file="$4" local_output="$5"
+    local local_tmp
+    local_tmp=$(mktemp -d /tmp/kbtool.XXXXXX)
+    local transfer_id="kbtool_$(date +%s)_${RANDOM}"
+    local remote_prefix="/tmp/${transfer_id}"
+
+    local file_size
+    file_size=$(kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "wc -c < '${remote_file}'" 2>/dev/null | tr -d ' \r') || {
+        log_error "Cannot get file size"
+        rm -rf "$local_tmp"
+        return 1
+    }
+
+    if [[ "$file_size" -eq 0 ]]; then
+        touch "$local_output"
+        rm -rf "$local_tmp"
+        return 0
+    fi
+
+    kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- split -b "$CHUNK_SIZE" "$remote_file" "${remote_prefix}_" 2>/dev/null || {
+        log_error "Split failed"
+        rm -rf "$local_tmp"
+        return 1
+    }
+
+    local chunks
+    chunks=$(kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "ls -1 ${remote_prefix}_*" 2>/dev/null) || true
+
+    if [[ -z "$chunks" ]]; then
+        log_error "No chunks produced"
+        kubectl exec "$pod" -n "$namespace" -c "$container" \
+            -- sh -c "rm -f ${remote_prefix}_*" 2>/dev/null || true
+        rm -rf "$local_tmp"
+        return 1
+    fi
+
+    local chunk_sizes
+    chunk_sizes=$(kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "for f in ${remote_prefix}_*; do wc -c < \"\$f\"; done" 2>/dev/null | tr -d ' \r')
+
+    _KB_START_TIME=$(date +%s)
+    local i=0 transferred=0 chunk name elapsed now
+    local size_arr=($chunk_sizes)
+
+    for chunk in $chunks; do
+        local expected_size="${size_arr[$i]:-0}"
+        i=$((i+1))
+        name=$(basename "$chunk")
+        download_chunk "$namespace" "$pod" "$container" "$chunk" "${local_tmp}/${name}" "$expected_size" || {
+            log_error "Transfer failed after ${_KB_RETRY_MAX} retries: ${name}"
+            kubectl exec "$pod" -n "$namespace" -c "$container" \
+                -- sh -c "rm -f ${remote_prefix}_*" 2>/dev/null || true
+            rm -rf "$local_tmp"
+            return 1
+        }
+        transferred=$(( transferred + expected_size ))
+        now=$(date +%s)
+        elapsed=$(( now - _KB_START_TIME ))
+        progress_bar "$transferred" "$file_size" "$elapsed"
+    done
+
+    cat "${local_tmp}/${transfer_id}_"* > "$local_output" || {
+        rm -rf "$local_tmp"
+        return 1
+    }
+
+    kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "rm -f ${remote_prefix}_*" 2>/dev/null || true
+    rm -rf "$local_tmp"
+    return 0
+}
+
+chunk_transfer_upload() {
+    local namespace="$1" pod="$2" container="$3" local_file="$4" remote_dir="$5"
+    local local_tmp
+    local_tmp=$(mktemp -d /tmp/kbtool.XXXXXX)
+    local transfer_id="kbtool_$(date +%s)_${RANDOM}"
+    local remote_prefix="/tmp/${transfer_id}"
+
+    local file_size
+    file_size=$(stat -c%s "$local_file" 2>/dev/null) || {
+        log_error "Cannot read local file: ${local_file}"
+        rm -rf "$local_tmp"
+        return 1
+    }
+
+    if [[ "$file_size" -eq 0 ]]; then
+        kubectl exec "$pod" -n "$namespace" -c "$container" \
+            -- sh -c "touch '${remote_dir}/$(basename "$local_file")'" 2>/dev/null
+        rm -rf "$local_tmp"
+        return 0
+    fi
+
+    split -b "$CHUNK_SIZE" "$local_file" "${local_tmp}/${transfer_id}_" || {
+        log_error "Local split failed"
+        rm -rf "$local_tmp"
+        return 1
+    }
+
+    local chunks
+    chunks=$(ls -1 "${local_tmp}/${transfer_id}_"* 2>/dev/null) || true
+
+    if [[ -z "$chunks" ]]; then
+        log_error "No chunks produced"
+        rm -rf "$local_tmp"
+        return 1
+    fi
+
+    _KB_START_TIME=$(date +%s)
+    local i=0 transferred=0 chunk name elapsed now
+
+    for chunk in $chunks; do
+        i=$((i+1))
+        name=$(basename "$chunk")
+        upload_chunk "$namespace" "$pod" "$container" "$chunk" "${remote_prefix}_${name##*_}" || {
+            log_error "Upload failed after ${_KB_RETRY_MAX} retries: ${name}"
+            kubectl exec "$pod" -n "$namespace" -c "$container" \
+                -- sh -c "rm -f ${remote_prefix}_*" 2>/dev/null || true
+            rm -rf "$local_tmp"
+            return 1
+        }
+        transferred=$(( transferred + $(stat -c%s "$chunk" 2>/dev/null || echo 0) ))
+        now=$(date +%s)
+        elapsed=$(( now - _KB_START_TIME ))
+        progress_bar "$transferred" "$file_size" "$elapsed"
+    done
+
+    kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "cat ${remote_prefix}_* > '${remote_dir}/$(basename "$local_file")'" || {
+        log_error "Remote reassembly failed"
+        kubectl exec "$pod" -n "$namespace" -c "$container" \
+            -- sh -c "rm -f ${remote_prefix}_*" 2>/dev/null || true
+        rm -rf "$local_tmp"
+        return 1
+    }
+
+    kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "rm -f ${remote_prefix}_*" 2>/dev/null || true
+    rm -rf "$local_tmp"
+    return 0
+}
+
+_KB_CLEANUP_POD=""
+_KB_CLEANUP_NS=""
+_KB_CLEANUP_CTR=""
+_KB_CLEANUP_REMOTE=""
+_KB_CLEANUP_LOCAL=""
+
+kb_cleanup() {
+    if [[ -n "$_KB_CLEANUP_POD" ]]; then
+        kubectl exec "$_KB_CLEANUP_POD" -n "$_KB_CLEANUP_NS" -c "$_KB_CLEANUP_CTR" \
+            -- sh -c "rm -f ${_KB_CLEANUP_REMOTE}*" 2>/dev/null || true
+        _KB_CLEANUP_POD=""
+    fi
+    if [[ -n "$_KB_CLEANUP_LOCAL" ]] && [[ -d "$_KB_CLEANUP_LOCAL" ]]; then
+        rm -rf "$_KB_CLEANUP_LOCAL"
+        _KB_CLEANUP_LOCAL=""
+    fi
+}
+trap kb_cleanup EXIT
+
+cmd_cp() {
+    local namespace="$1" src="$2" dst="$3"
+    local pod container
+
+    if [[ "$src" == *":"* ]]; then
+        local pod_query="${src%%:*}"
+        local remote="${src#*:}"
+        pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+        container=$(resolve_container "$namespace" "$pod") || return 1
+        log_info "Downloading ${pod}:${remote} → ${dst}"
+        chunk_transfer_download "$namespace" "$pod" "$container" "$remote" "$dst" || {
+            log_error "Download failed"
+            return 1
+        }
+        log_ok "Download complete: ${dst} ($(du -h "$dst" | cut -f1))"
+    elif [[ "$dst" == *":"* ]]; then
+        local pod_query="${dst%%:*}"
+        local remote="${dst#*:}"
+        pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+        container=$(resolve_container "$namespace" "$pod") || return 1
+        if [[ ! -f "$src" ]]; then
+            log_error "Local file not found: ${src}"
+            return 1
+        fi
+        log_info "Uploading ${src} → ${pod}:${remote}"
+        chunk_transfer_upload "$namespace" "$pod" "$container" "$src" "$remote" || {
+            log_error "Upload failed"
+            return 1
+        }
+        log_ok "Upload complete"
+    else
+        log_error "One path must be a pod reference (podname:/path)"
+        return 1
+    fi
+}
+
+cmd_bash() {
+    local namespace="$1" pod_query="$2"
+    local pod container
+    pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+    container=$(resolve_container "$namespace" "$pod") || return 1
+    local ps1='\[\033[1;31m\][\[\033[1;33m\]'"${namespace}"'\[\033[1;31m\]:\[\033[0;32m\]'"${pod}"'\[\033[1;31m\]] \w # '
+    log_info "Shell in ${pod} [${container}]"
+    kubectl exec -it "$pod" -n "$namespace" -c "$container" \
+        -- env "PS1=${ps1}" bash --norc 2>/dev/null || \
+        kubectl exec -it "$pod" -n "$namespace" -c "$container" \
+        -- env "PS1=[${namespace}:${pod}] " sh
+}
+
+cmd_db_console() {
+    local namespace="$1" pod_query="$2" db_type="$3"
+    local pod container
+    pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+    container=$(resolve_container "$namespace" "$pod") || return 1
+
+    local user="" db="" password="" client=""
+    local pw_esc
+
+    case "$db_type" in
+        mariadb|mysql)
+            client="mysql"
+            user=$(get_env "$namespace" "$pod" "$container" "MYSQL_USER") || true
+            db=$(get_env "$namespace" "$pod" "$container" "MYSQL_DATABASE") || true
+            password=$(get_env "$namespace" "$pod" "$container" "MYSQL_PASSWORD") || true
+            if [[ -z "$user" ]]; then
+                user="root"
+                password=$(get_env "$namespace" "$pod" "$container" "MYSQL_ROOT_PASSWORD") || true
+            fi
+            ;;
+        psql)
+            client="psql"
+            user=$(get_env "$namespace" "$pod" "$container" "POSTGRES_USER") || true
+            db=$(get_env "$namespace" "$pod" "$container" "POSTGRES_DB") || true
+            password=$(get_env "$namespace" "$pod" "$container" "PGPASSWORD") || true
+            [[ -z "$user" ]] && user="postgres"
+            [[ -z "$db" ]] && db="postgres"
+            ;;
+    esac
+
+    pw_esc=$(escape_shell "$password")
+
+    local red='\033[1;31m'
+    local yellow='\033[1;33m'
+    local green='\033[0;32m'
+    local reset='\033[0m'
+    local db_prompt
+    db_prompt=$(printf "${red}[${yellow}${namespace}${red}:${green}${pod}${red}] (${reset}\\d${red})> ${reset}")
+
+    local cmd=""
+    case "$db_type" in
+        mariadb|mysql)
+            cmd="${client} -u${user}"
+            [[ -n "$password" ]] && cmd="${cmd} -p'${pw_esc}'"
+            [[ -n "$db" ]] && cmd="${cmd} ${db}"
+            ;;
+        psql)
+            local psql_prompt
+            psql_prompt=$(printf "${red}[${yellow}${namespace}${red}:${green}${pod}${red}] ${reset}%~%R%# ")
+            cmd="PGPASSWORD='${pw_esc}' psql -U${user}"
+            [[ -n "$db" ]] && cmd="${cmd} -d ${db}"
+            cmd="${cmd} -c \"\\set PROMPT1 '${psql_prompt}'\""
+            ;;
+    esac
+
+    log_info "Connecting to ${db_type}: user=${user} db=${db:-<default>}"
+    case "$db_type" in
+        mariadb|mysql)
+            kubectl exec -it "$pod" -n "$namespace" -c "$container" \
+                -- env "MYSQL_PS1=${db_prompt}" sh -c "$cmd"
+            ;;
+        psql)
+            kubectl exec -it "$pod" -n "$namespace" -c "$container" \
+                -- sh -c "$cmd"
+            ;;
+    esac
+}
+
+do_dump() {
+    local namespace="$1" pod="$2" container="$3" output="$4" dump_cmd="$5" db_type="$6"
+
+    local dump_id="kbtool_$(date +%s)_${RANDOM}"
+    local remote="/tmp/${dump_id}"
+    local local_tmp
+    local_tmp=$(mktemp -d /tmp/kbtool.XXXXXX)
+
+    _KB_CLEANUP_POD="$pod"
+    _KB_CLEANUP_NS="$namespace"
+    _KB_CLEANUP_CTR="$container"
+    _KB_CLEANUP_REMOTE="$remote"
+    _KB_CLEANUP_LOCAL="$local_tmp"
+
+    log_info "[1/3] ${db_type} dump on ${pod}..."
+    kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- sh -c "${dump_cmd} > ${remote}.sql" || {
+        log_error "Dump failed"
+        kb_cleanup; return 1
+    }
+
+    log_info "[2/3] Compressing..."
+    kubectl exec "$pod" -n "$namespace" -c "$container" \
+        -- gzip -f "${remote}.sql" || {
+        log_error "Compression failed"
+        kb_cleanup; return 1
+    }
+
+    log_info "[3/3] Transferring..."
+    chunk_transfer_download "$namespace" "$pod" "$container" "${remote}.sql.gz" "${local_tmp}/dump.sql.gz" || {
+        log_error "Transfer failed"
+        kb_cleanup; return 1
+    }
+
+    if [[ "$output" == *.gz ]]; then
+        cp "${local_tmp}/dump.sql.gz" "$output"
+        log_ok "Saved: ${output} (compressed, $(du -h "$output" | cut -f1))"
+    else
+        gunzip -c "${local_tmp}/dump.sql.gz" > "$output"
+        log_ok "Saved: ${output} (uncompressed, $(du -h "$output" | cut -f1))"
+    fi
+
+    kb_cleanup
+}
+
+cmd_pgdump() {
+    local namespace="$1" pod_query="$2" output="$3"
+    local pod container
+    pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+    container=$(resolve_container "$namespace" "$pod") || return 1
+
+    local user db password pw_esc dump_cmd
+    user=$(get_env "$namespace" "$pod" "$container" "POSTGRES_USER") || true
+    db=$(get_env "$namespace" "$pod" "$container" "POSTGRES_DB") || true
+    password=$(get_env "$namespace" "$pod" "$container" "PGPASSWORD") || true
+    [[ -z "$user" ]] && user="postgres"
+    [[ -z "$db" ]] && db="postgres"
+
+    pw_esc=$(escape_shell "$password")
+    dump_cmd="PGPASSWORD='${pw_esc}' pg_dump -U${user} ${db}"
+
+    do_dump "$namespace" "$pod" "$container" "$output" "$dump_cmd" "PostgreSQL"
+}
+
+cmd_mysqldump() {
+    local namespace="$1" pod_query="$2" output="$3" client="${4:-mysqldump}" db_type="${5:-MySQL}"
+    local pod container
+    pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+    container=$(resolve_container "$namespace" "$pod") || return 1
+
+    local user db password
+    user=$(get_env "$namespace" "$pod" "$container" "MYSQL_USER") || true
+    db=$(get_env "$namespace" "$pod" "$container" "MYSQL_DATABASE") || true
+    password=$(get_env "$namespace" "$pod" "$container" "MYSQL_PASSWORD") || true
+    if [[ -z "$user" ]]; then
+        user="root"
+        password=$(get_env "$namespace" "$pod" "$container" "MYSQL_ROOT_PASSWORD") || true
+    fi
+
+    local pw_esc dump_cmd
+    pw_esc=$(escape_shell "$password")
+    dump_cmd="MYSQL_PWD='${pw_esc}' ${client} --single-transaction --routines -u${user}"
+    [[ -n "$db" ]] && dump_cmd="${dump_cmd} ${db}"
+
+    do_dump "$namespace" "$pod" "$container" "$output" "$dump_cmd" "$db_type"
+}
+
+usage() {
+    cat <<EOF
+${BOLD}kbtool${NC} v${VERSION} — Simplified kubectl pod operations
+
+${BOLD}Usage:${NC}
+  kbtool <command> <namespace> [args...]
+  kbtool <command> <namespace> [args...] --chunk-size=10M --retries=10
+
+${BOLD}Options:${NC}
+  --chunk-size=SIZE   Chunk size for transfers (default: 3M, env: KBTOOL_CHUNK_SIZE)
+  --retries=N         Max retries per chunk (default: 20, env: KBTOOL_RETRIES)
+
+${BOLD}Commands:${NC}
+  cp <ns> <src> <dst>          Copy files (pod:/path <-> local)
+  bash <ns> <pod>              Interactive shell in pod
+  mariadb <ns> <pod>           MariaDB console
+  mysql <ns> <pod>             MySQL console
+  psql <ns> <pod>              PostgreSQL console
+  pgdump <ns> <pod> <output>   PostgreSQL dump
+  mariadb_dump <ns> <pod> <out> MariaDB dump
+  mysql_dump <ns> <pod> <out>  MySQL dump
+
+${BOLD}Pod Discovery:${NC}
+  Pod names accept partial substrings. If multiple pods match,
+  you will be prompted to select one.
+
+${BOLD}Dump Output:${NC}
+  .gz extension -> kept compressed
+  .sql extension -> uncompressed
+
+${BOLD}Examples:${NC}
+  kbtool cp production api:/var/log/app.log ./app.log
+  kbtool bash staging api
+  kbtool psql production db
+  kbtool pgdump production db ./dump.sql
+  kbtool mariadb_dump staging db ./dump.sql.gz
+EOF
+}
+
+main() {
+    check_deps
+
+    local _args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --chunk-size=*) CHUNK_SIZE="${1#--chunk-size=}"; shift ;;
+            --retries=*) _KB_RETRY_MAX="${1#--retries=}"; shift ;;
+            *) _args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${_args[@]}"
+
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 0
+    fi
+
+    case "${1}" in
+        -h|--help|help)  usage; exit 0 ;;
+        -v|--version)    echo "kbtool v${VERSION}"; exit 0 ;;
+    esac
+
+    if [[ $# -lt 2 ]]; then
+        log_error "Missing args. Usage: kbtool <command> <namespace> [args...]"
+        exit 1
+    fi
+
+    local command="$1" namespace="$2"
+    shift 2
+
+    case "$command" in
+        cp)
+            [[ $# -lt 2 ]] && { log_error "Usage: kbtool cp <ns> <src> <dst>"; exit 1; }
+            cmd_cp "$namespace" "$1" "$2"
+            ;;
+        bash|sh)
+            [[ $# -lt 1 ]] && { log_error "Usage: kbtool bash <ns> <pod>"; exit 1; }
+            cmd_bash "$namespace" "$1"
+            ;;
+        mariadb|mysql)
+            [[ $# -lt 1 ]] && { log_error "Usage: kbtool ${command} <ns> <pod>"; exit 1; }
+            cmd_db_console "$namespace" "$1" "$command"
+            ;;
+        psql)
+            [[ $# -lt 1 ]] && { log_error "Usage: kbtool psql <ns> <pod>"; exit 1; }
+            cmd_db_console "$namespace" "$1" "psql"
+            ;;
+        pgdump)
+            [[ $# -lt 2 ]] && { log_error "Usage: kbtool pgdump <ns> <pod> <output>"; exit 1; }
+            cmd_pgdump "$namespace" "$1" "$2"
+            ;;
+        mariadb_dump)
+            [[ $# -lt 2 ]] && { log_error "Usage: kbtool mariadb_dump <ns> <pod> <output>"; exit 1; }
+            cmd_mysqldump "$namespace" "$1" "$2" "mariadb-dump" "MariaDB"
+            ;;
+        mysql_dump)
+            [[ $# -lt 2 ]] && { log_error "Usage: kbtool mysql_dump <ns> <pod> <output>"; exit 1; }
+            cmd_mysqldump "$namespace" "$1" "$2" "mysqldump" "MySQL"
+            ;;
+        *)
+            log_error "Unknown command: ${command}"
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

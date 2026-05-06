@@ -172,10 +172,32 @@ kbtool mariadb_dump production db ./dump.sql.gz
 
 ## Configuração
 
+### Valores Padrão
+
+Persistido em `~/.config/kbtool/config`:
+
+```bash
+# Ver config atual
+kbtool config
+
+# Alterar padrões
+kbtool config chunk-size=10M
+kbtool config retries=25
+
+# Ambos de uma vez
+kbtool config chunk-size=10M retries=25
+```
+
+### Prioridade
+
+```
+CLI flags (--chunk-size=10M) > config file > env vars > defaults (3M / 20)
+```
+
 | Opção | Env var | Default | Descrição |
 |-------|---------|---------|-----------|
-| `--chunk-size=10M` | `KBTOOL_CHUNK_SIZE=10M` | `3M` | Tamanho dos chunks para transferência |
-| `--retries=10` | `KBTOOL_RETRIES=10` | `20` | Tentativas por chunk em caso de falha |
+| `--chunk-size=SIZE` | `KBTOOL_CHUNK_SIZE` | `3M` | Tamanho dos chunks para transferência |
+| `--retries=N` | `KBTOOL_RETRIES` | `20` | Tentativas por chunk em caso de falha |
 
 As opções CLI podem ser passadas em qualquer posição:
 

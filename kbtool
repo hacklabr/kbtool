@@ -15,6 +15,93 @@ NC=$'\033[0m'
 
 KBTOOL_DIR="${HOME}/.config/kbtool"
 KBTOOL_CLUSTERS="${KBTOOL_DIR}/clusters"
+KBTOOL_CONFIG="${KBTOOL_DIR}/config"
+
+_kb_load_config() {
+    if [[ -f "$KBTOOL_CONFIG" ]]; then
+        while IFS='=' read -r key val; do
+            [[ -z "$key" ]] && continue
+            [[ "$key" =~ ^# ]] && continue
+            case "$key" in
+                chunk-size) CHUNK_SIZE="$val" ;;
+                retries) _KB_RETRY_MAX="$val" ;;
+            esac
+        done < "$KBTOOL_CONFIG"
+    fi
+}
+
+cmd_config() {
+    if [[ $# -eq 0 ]]; then
+        if [[ ! -f "$KBTOOL_CONFIG" ]]; then
+            echo "No config set. Defaults: chunk-size=3M, retries=20"
+            return 0
+        fi
+        echo "Current config (${KBTOOL_CONFIG}):"
+        while IFS='=' read -r key val; do
+            [[ -z "$key" ]] && continue
+            [[ "$key" =~ ^# ]] && continue
+            echo "  ${key} = ${val}"
+        done < "$KBTOOL_CONFIG"
+        return 0
+    fi
+
+    mkdir -p "$KBTOOL_DIR"
+
+    local changed=0
+    for arg in "$@"; do
+        local key="${arg%%=*}"
+        local val="${arg#*=}"
+        case "$key" in
+            chunk-size)
+                if [[ -z "$val" ]]; then
+                    log_error "Usage: config chunk-size=<value>"
+                    return 1
+                fi
+                _kb_config_set "chunk-size" "$val"
+                CHUNK_SIZE="$val"
+                changed=1
+                ;;
+            retries)
+                if [[ -z "$val" ]] || ! [[ "$val" =~ ^[0-9]+$ ]]; then
+                    log_error "Usage: config retries=<number>"
+                    return 1
+                fi
+                _kb_config_set "retries" "$val"
+                _KB_RETRY_MAX="$val"
+                changed=1
+                ;;
+            *)
+                log_error "Unknown config key: ${key}. Valid: chunk-size, retries"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ "$changed" -eq 1 ]]; then
+        log_ok "Config updated"
+    fi
+}
+
+_kb_config_set() {
+    local key="$1" val="$2"
+    if [[ ! -f "$KBTOOL_CONFIG" ]]; then
+        echo "${key}=${val}" > "$KBTOOL_CONFIG"
+        return
+    fi
+    local found=0
+    local tmp
+    tmp=$(mktemp)
+    while IFS='=' read -r k v; do
+        if [[ "$k" == "$key" ]]; then
+            echo "${key}=${val}" >> "$tmp"
+            found=1
+        else
+            echo "${k}=${v}" >> "$tmp"
+        fi
+    done < "$KBTOOL_CONFIG"
+    [[ "$found" -eq 0 ]] && echo "${key}=${val}" >> "$tmp"
+    mv "$tmp" "$KBTOOL_CONFIG"
+}
 
 _kb_session_file() {
     local sess
@@ -36,6 +123,7 @@ log_warn()  { echo -e "${YELLOW}!${NC} $*" >&2; }
 log_ok()    { echo -e "${GREEN}✓${NC} $*" >&2; }
 
 check_deps() {
+    _kb_load_config
     if ! command -v kubectl &>/dev/null; then
         log_error "kubectl not found in PATH"
         exit 1
@@ -780,10 +868,17 @@ ${BOLD}Usage:${NC}
   kbtool <command> <namespace> [args...] --chunk-size=10M --retries=10
   kbtool cluster <action> <slug>
   kbtool use <slug>
+  kbtool config [key=value ...]
 
 ${BOLD}Options:${NC}
   --chunk-size=SIZE   Chunk size for transfers (default: 3M, env: KBTOOL_CHUNK_SIZE)
   --retries=N         Max retries per chunk (default: 20, env: KBTOOL_RETRIES)
+
+${BOLD}Config:${NC}
+  config                     Show current config
+  config chunk-size=10M      Set default chunk size
+  config retries=25          Set default retries
+  (stored in ~/.config/kbtool/config)
 
 ${BOLD}Cluster Commands:${NC}
   cluster add <slug>        Add a new kubeconfig (interactive)
@@ -878,6 +973,9 @@ main() {
             ;;
         use)
             cmd_use "${1:-}"
+            ;;
+        config)
+            cmd_config "$@"
             ;;
         *)
             if [[ $# -lt 1 ]]; then

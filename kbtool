@@ -752,10 +752,11 @@ cmd_db_console() {
             ;;
         psql)
             local psql_prompt
-            psql_prompt=$(printf "${red}[${yellow}${namespace}${red}:${green}${pod}${red}] ${reset}%~%R%# ")
-            cmd="PGPASSWORD='${pw_esc}' psql -U${user}"
+            psql_prompt=$(printf "${red}[${yellow}${namespace}${red}:${green}${pod}${red}] ${reset}")'%~%R%# '
+            local psql_prompt_esc
+            psql_prompt_esc=$(escape_shell "$psql_prompt")
+            cmd="PGPASSWORD='${pw_esc}' psql -v PROMPT1='${psql_prompt_esc}' -U${user}"
             [[ -n "$db" ]] && cmd="${cmd} -d ${db}"
-            cmd="${cmd} -c \"\\set PROMPT1 '${psql_prompt}'\""
             ;;
     esac
 

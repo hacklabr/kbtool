@@ -257,6 +257,16 @@ cmd_cluster_list() {
     fi
 }
 
+_kb_cache_ns() {
+    local cache_dir="${KBTOOL_DIR}/cache"
+    mkdir -p "$cache_dir"
+    local slug
+    slug=$(cat "$(_kb_session_file)" 2>/dev/null) || return 0
+    kubectl get namespaces --request-timeout=10s \
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null \
+        | tr ' ' '\n' | sort > "${cache_dir}/${slug}.ns" 2>/dev/null
+}
+
 cmd_use() {
     local slug="${1:-}"
     if [[ -z "$slug" ]]; then
@@ -278,6 +288,8 @@ cmd_use() {
     echo "$slug" > "$(_kb_session_file)"
     export KUBECONFIG="$target"
     log_ok "Now using cluster: ${slug}"
+
+    _kb_cache_ns &
 }
 
 resolve_pod() {

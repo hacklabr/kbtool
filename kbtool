@@ -13,6 +13,23 @@ BOLD=$'\033[1m'
 DIM=$'\033[2m'
 NC=$'\033[0m'
 
+KBTOOL_DIR="${HOME}/.config/kbtool"
+KBTOOL_CLUSTERS="${KBTOOL_DIR}/clusters"
+
+_kb_session_file() {
+    local sess
+    sess=$(tty 2>/dev/null | tr -c 'a-zA-Z0-9' '_') || sess="_default"
+    echo "/tmp/kbtool_active${sess}"
+}
+
+_kb_get_active() {
+    local sf
+    sf=$(_kb_session_file)
+    if [[ -f "$sf" ]]; then
+        cat "$sf" 2>/dev/null || true
+    fi
+}
+
 log_error() { echo -e "${RED}✗${NC} $*" >&2; }
 log_info()  { echo -e "${CYAN}→${NC} $*" >&2; }
 log_warn()  { echo -e "${YELLOW}!${NC} $*" >&2; }
@@ -23,6 +40,156 @@ check_deps() {
         log_error "kubectl not found in PATH"
         exit 1
     fi
+    local slug
+    slug=$(_kb_get_active)
+    if [[ -n "$slug" ]]; then
+        local kubeconfig="${KBTOOL_CLUSTERS}/${slug}.yaml"
+        if [[ -f "$kubeconfig" ]]; then
+            export KUBECONFIG="$kubeconfig"
+        fi
+    fi
+}
+
+validate_slug() {
+    local slug="$1"
+    if [[ -z "$slug" ]]; then
+        log_error "Slug cannot be empty"
+        return 1
+    fi
+    if [[ ! "$slug" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        log_error "Invalid slug '${slug}'. Use letters, numbers, hyphens, underscores, dots"
+        return 1
+    fi
+}
+
+validate_kubeconfig() {
+    local content="$1"
+    if [[ -z "$content" ]]; then
+        log_error "Empty kubeconfig"
+        return 1
+    fi
+    if ! echo "$content" | grep -q "apiVersion"; then
+        log_error "Invalid kubeconfig: missing apiVersion"
+        return 1
+    fi
+    if ! echo "$content" | grep -q "kind:"; then
+        log_error "Invalid kubeconfig: missing kind"
+        return 1
+    fi
+}
+
+read_kubeconfig_interactive() {
+    echo -e "${BOLD}Paste the kubeconfig content, then press Ctrl-D to finish:${NC}" >&2
+    local content
+    content=$(cat)
+    if ! validate_kubeconfig "$content"; then
+        return 1
+    fi
+    echo "$content"
+}
+
+cmd_cluster_add() {
+    local slug="$1"
+    validate_slug "$slug" || return 1
+    local target="${KBTOOL_CLUSTERS}/${slug}.yaml"
+    if [[ -f "$target" ]]; then
+        log_error "Cluster '${slug}' already exists. Use 'cluster update ${slug}' to modify."
+        return 1
+    fi
+    mkdir -p "$KBTOOL_CLUSTERS"
+    local content
+    content=$(read_kubeconfig_interactive) || return 1
+    echo "$content" > "$target"
+    chmod 600 "$target"
+    log_ok "Cluster '${slug}' added successfully"
+}
+
+cmd_cluster_rm() {
+    local slug="$1"
+    validate_slug "$slug" || return 1
+    local target="${KBTOOL_CLUSTERS}/${slug}.yaml"
+    if [[ ! -f "$target" ]]; then
+        log_error "Cluster '${slug}' not found"
+        return 1
+    fi
+    echo -en "${YELLOW}Remove cluster '${slug}'? [y/N] ${NC}" >&2
+    read -r confirm < /dev/tty
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+    rm -f "$target"
+    for sf in /tmp/kbtool_active_*; do
+        [[ -f "$sf" ]] || continue
+        local active
+        active=$(cat "$sf" 2>/dev/null) || true
+        if [[ "$active" == "$slug" ]]; then
+            rm -f "$sf"
+        fi
+    done
+    log_ok "Cluster '${slug}' removed"
+}
+
+cmd_cluster_update() {
+    local slug="$1"
+    validate_slug "$slug" || return 1
+    local target="${KBTOOL_CLUSTERS}/${slug}.yaml"
+    if [[ ! -f "$target" ]]; then
+        log_error "Cluster '${slug}' not found. Use 'cluster add ${slug}' first."
+        return 1
+    fi
+    local content
+    content=$(read_kubeconfig_interactive) || return 1
+    echo "$content" > "$target"
+    chmod 600 "$target"
+    log_ok "Cluster '${slug}' updated"
+}
+
+cmd_cluster_list() {
+    if [[ ! -d "$KBTOOL_CLUSTERS" ]]; then
+        echo "No clusters configured. Use 'kbtool cluster add <slug>' to add one."
+        return 0
+    fi
+    local active
+    active=$(_kb_get_active)
+    local found=0
+    for f in "${KBTOOL_CLUSTERS}"/*.yaml; do
+        [[ -f "$f" ]] || continue
+        found=1
+        local slug
+        slug=$(basename "$f" .yaml)
+        if [[ "$slug" == "$active" ]]; then
+            echo -e "  ${GREEN}* ${slug}${NC}"
+        else
+            echo "    ${slug}"
+        fi
+    done
+    if [[ "$found" -eq 0 ]]; then
+        echo "No clusters configured. Use 'kbtool cluster add <slug>' to add one."
+    fi
+}
+
+cmd_use() {
+    local slug="${1:-}"
+    if [[ -z "$slug" ]]; then
+        local active
+        active=$(_kb_get_active)
+        if [[ -n "$active" ]] && [[ -f "${KBTOOL_CLUSTERS}/${active}.yaml" ]]; then
+            log_info "Active cluster: ${active}"
+        else
+            log_warn "No active cluster in this session"
+        fi
+        return 0
+    fi
+    local target="${KBTOOL_CLUSTERS}/${slug}.yaml"
+    if [[ ! -f "$target" ]]; then
+        log_error "Cluster '${slug}' not found"
+        cmd_cluster_list
+        return 1
+    fi
+    echo "$slug" > "$(_kb_session_file)"
+    export KUBECONFIG="$target"
+    log_ok "Now using cluster: ${slug}"
 }
 
 resolve_pod() {
@@ -611,12 +778,21 @@ ${BOLD}kbtool${NC} v${VERSION} — Simplified kubectl pod operations
 ${BOLD}Usage:${NC}
   kbtool <command> <namespace> [args...]
   kbtool <command> <namespace> [args...] --chunk-size=10M --retries=10
+  kbtool cluster <action> <slug>
+  kbtool use <slug>
 
 ${BOLD}Options:${NC}
   --chunk-size=SIZE   Chunk size for transfers (default: 3M, env: KBTOOL_CHUNK_SIZE)
   --retries=N         Max retries per chunk (default: 20, env: KBTOOL_RETRIES)
 
-${BOLD}Commands:${NC}
+${BOLD}Cluster Commands:${NC}
+  cluster add <slug>        Add a new kubeconfig (interactive)
+  cluster rm <slug>         Remove a kubeconfig (confirms)
+  cluster update <slug>     Update a kubeconfig (interactive)
+  cluster list              List configured clusters
+  use <slug>                Set active cluster
+
+${BOLD}Pod Commands:${NC}
   cp <ns> <src> <dst>          Copy files (pod:/path <-> local)
   bash <ns> <pod>              Interactive shell in pod
   mariadb <ns> <pod>           MariaDB console
@@ -635,6 +811,8 @@ ${BOLD}Dump Output:${NC}
   .sql extension -> uncompressed
 
 ${BOLD}Examples:${NC}
+  kbtool cluster add production
+  kbtool use production
   kbtool cp production api:/var/log/app.log ./app.log
   kbtool bash staging api
   kbtool psql production db
@@ -666,47 +844,82 @@ main() {
         -v|--version)    echo "kbtool v${VERSION}"; exit 0 ;;
     esac
 
-    if [[ $# -lt 2 ]]; then
-        log_error "Missing args. Usage: kbtool <command> <namespace> [args...]"
-        exit 1
-    fi
-
-    local command="$1" namespace="$2"
-    shift 2
+    local command="$1"
+    shift
 
     case "$command" in
-        cp)
-            [[ $# -lt 2 ]] && { log_error "Usage: kbtool cp <ns> <src> <dst>"; exit 1; }
-            cmd_cp "$namespace" "$1" "$2"
+        cluster)
+            if [[ $# -lt 1 ]]; then
+                log_error "Usage: kbtool cluster <add|rm|update|list> [slug]"
+                exit 1
+            fi
+            local action="$1"; shift
+            case "$action" in
+                add)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool cluster add <slug>"; exit 1; }
+                    cmd_cluster_add "$1"
+                    ;;
+                rm|remove)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool cluster rm <slug>"; exit 1; }
+                    cmd_cluster_rm "$1"
+                    ;;
+                update)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool cluster update <slug>"; exit 1; }
+                    cmd_cluster_update "$1"
+                    ;;
+                list|ls)
+                    cmd_cluster_list
+                    ;;
+                *)
+                    log_error "Unknown cluster action: ${action}"
+                    exit 1
+                    ;;
+            esac
             ;;
-        bash|sh)
-            [[ $# -lt 1 ]] && { log_error "Usage: kbtool bash <ns> <pod>"; exit 1; }
-            cmd_bash "$namespace" "$1"
-            ;;
-        mariadb|mysql)
-            [[ $# -lt 1 ]] && { log_error "Usage: kbtool ${command} <ns> <pod>"; exit 1; }
-            cmd_db_console "$namespace" "$1" "$command"
-            ;;
-        psql)
-            [[ $# -lt 1 ]] && { log_error "Usage: kbtool psql <ns> <pod>"; exit 1; }
-            cmd_db_console "$namespace" "$1" "psql"
-            ;;
-        pgdump)
-            [[ $# -lt 2 ]] && { log_error "Usage: kbtool pgdump <ns> <pod> <output>"; exit 1; }
-            cmd_pgdump "$namespace" "$1" "$2"
-            ;;
-        mariadb_dump)
-            [[ $# -lt 2 ]] && { log_error "Usage: kbtool mariadb_dump <ns> <pod> <output>"; exit 1; }
-            cmd_mysqldump "$namespace" "$1" "$2" "mariadb-dump" "MariaDB"
-            ;;
-        mysql_dump)
-            [[ $# -lt 2 ]] && { log_error "Usage: kbtool mysql_dump <ns> <pod> <output>"; exit 1; }
-            cmd_mysqldump "$namespace" "$1" "$2" "mysqldump" "MySQL"
+        use)
+            cmd_use "${1:-}"
             ;;
         *)
-            log_error "Unknown command: ${command}"
-            usage >&2
-            exit 1
+            if [[ $# -lt 1 ]]; then
+                log_error "Missing args. Usage: kbtool <command> <namespace> [args...]"
+                exit 1
+            fi
+            local namespace="$1"; shift
+            case "$command" in
+                cp)
+                    [[ $# -lt 2 ]] && { log_error "Usage: kbtool cp <ns> <src> <dst>"; exit 1; }
+                    cmd_cp "$namespace" "$1" "$2"
+                    ;;
+                bash|sh)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool bash <ns> <pod>"; exit 1; }
+                    cmd_bash "$namespace" "$1"
+                    ;;
+                mariadb|mysql)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool ${command} <ns> <pod>"; exit 1; }
+                    cmd_db_console "$namespace" "$1" "$command"
+                    ;;
+                psql)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool psql <ns> <pod>"; exit 1; }
+                    cmd_db_console "$namespace" "$1" "psql"
+                    ;;
+                pgdump)
+                    [[ $# -lt 2 ]] && { log_error "Usage: kbtool pgdump <ns> <pod> <output>"; exit 1; }
+                    cmd_pgdump "$namespace" "$1" "$2"
+                    ;;
+                mariadb_dump)
+                    [[ $# -lt 2 ]] && { log_error "Usage: kbtool mariadb_dump <ns> <pod> <output>"; exit 1; }
+                    cmd_mysqldump "$namespace" "$1" "$2" "mariadb-dump" "MariaDB"
+                    ;;
+                mysql_dump)
+                    [[ $# -lt 2 ]] && { log_error "Usage: kbtool mysql_dump <ns> <pod> <output>"; exit 1; }
+                    cmd_mysqldump "$namespace" "$1" "$2" "mysqldump" "MySQL"
+                    ;;
+                *)
+                    log_error "Unknown command: ${command}"
+                    usage >&2
+                    exit 1
+                    ;;
+            esac
             ;;
     esac
 }

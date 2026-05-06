@@ -4,6 +4,8 @@ _kbtool_pod_cache=""
 _kbtool_pod_cache_time=0
 _kbtool_pod_cache_ns=""
 
+_kbtool_clusters_dir="${HOME}/.config/kbtool/clusters"
+
 _kbtool_get_ns() {
     local now
     now=$(date +%s)
@@ -17,12 +19,23 @@ _kbtool_get_ns() {
 _kbtool_get_pods() {
     local ns="$1" now
     now=$(date +%s)
-    if [[ "$ns" != "$_kbtool_pod_cache_ns" ]] || (( now - _kbtool_pod_cache_time > 30 )); then
+    if [[ "$ns" != "_kbtool_pod_cache_ns" ]] || (( now - _kbtool_pod_cache_time > 30 )); then
         _kbtool_pod_cache=$(kubectl get pods -n "$ns" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
         _kbtool_pod_cache_time=$now
         _kbtool_pod_cache_ns="$ns"
     fi
     echo "$_kbtool_pod_cache"
+}
+
+_kbtool_get_slugs() {
+    local slugs=""
+    if [[ -d "$_kbtool_clusters_dir" ]]; then
+        for f in "$_kbtool_clusters_dir"/*.yaml; do
+            [[ -f "$f" ]] || continue
+            slugs+=" $(basename "$f" .yaml)"
+        done
+    fi
+    echo "$slugs"
 }
 
 _kbtool() {
@@ -37,52 +50,63 @@ _kbtool() {
         words=("${COMP_WORDS[@]}")
     fi
 
-    local command="" namespace=""
+    local command="" subcommand=""
     [[ ${#words[@]} -ge 2 ]] && command="${words[1]}"
-    [[ ${#words[@]} -ge 3 ]] && namespace="${words[2]}"
+    [[ ${#words[@]} -ge 3 ]] && subcommand="${words[2]}"
 
     case $cword in
         1)
             COMPREPLY=($(compgen -W \
-                "cp bash mariadb mysql psql pgdump mariadb_dump mysql_dump" -- "$cur"))
+                "cp bash mariadb mysql psql pgdump mariadb_dump mysql_dump cluster use" -- "$cur"))
             ;;
         2)
-            COMPREPLY=($(compgen -W "$(_kbtool_get_ns)" -- "$cur"))
-            ;;
-        *)
             case "$command" in
-                cp)
-                    case $cword in
-                        3)
-                            local pods="$(_kbtool_get_pods "$namespace")"
-                            local pod_complete=()
-                            local p
-                            for p in $pods; do pod_complete+=("$p:"); done
-                            _filedir 2>/dev/null || \
-                                COMPREPLY+=($(compgen -f -- "$cur"))
-                            COMPREPLY+=("${pod_complete[@]}")
-                            ;;
-                        4)
-                            _filedir 2>/dev/null || \
-                                COMPREPLY=($(compgen -f -- "$cur"))
+                cluster)
+                    COMPREPLY=($(compgen -W "add rm update list" -- "$cur"))
+                    ;;
+                use)
+                    COMPREPLY=($(compgen -W "$(_kbtool_get_slugs)" -- "$cur"))
+                    ;;
+                *)
+                    COMPREPLY=($(compgen -W "$(_kbtool_get_ns)" -- "$cur"))
+                    ;;
+            esac
+            ;;
+        3)
+            case "$command" in
+                cluster)
+                    case "$subcommand" in
+                        rm|update)
+                            COMPREPLY=($(compgen -W "$(_kbtool_get_slugs)" -- "$cur"))
                             ;;
                     esac
+                    ;;
+                cp)
+                    local pods="$(_kbtool_get_pods "$subcommand")"
+                    local pod_complete=()
+                    local p
+                    for p in $pods; do pod_complete+=("$p:"); done
+                    _filedir 2>/dev/null || \
+                        COMPREPLY+=($(compgen -f -- "$cur"))
+                    COMPREPLY+=("${pod_complete[@]}")
                     ;;
                 bash|mariadb|mysql|psql)
-                    if [[ $cword -eq 3 ]]; then
-                        COMPREPLY=($(compgen -W "$(_kbtool_get_pods "$namespace")" -- "$cur"))
-                    fi
+                    COMPREPLY=($(compgen -W "$(_kbtool_get_pods "$subcommand")" -- "$cur"))
                     ;;
                 pgdump|mariadb_dump|mysql_dump)
-                    case $cword in
-                        3)
-                            COMPREPLY=($(compgen -W "$(_kbtool_get_pods "$namespace")" -- "$cur"))
-                            ;;
-                        4)
-                            _filedir 2>/dev/null || \
-                                COMPREPLY=($(compgen -f -- "$cur"))
-                            ;;
-                    esac
+                    COMPREPLY=($(compgen -W "$(_kbtool_get_pods "$subcommand")" -- "$cur"))
+                    ;;
+            esac
+            ;;
+        4)
+            case "$command" in
+                cp)
+                    _filedir 2>/dev/null || \
+                        COMPREPLY=($(compgen -f -- "$cur"))
+                    ;;
+                pgdump|mariadb_dump|mysql_dump)
+                    _filedir 2>/dev/null || \
+                        COMPREPLY=($(compgen -f -- "$cur"))
                     ;;
             esac
             ;;

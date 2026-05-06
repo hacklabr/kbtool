@@ -1,6 +1,6 @@
 # kbtool
 
-Simplificador de operações com kubectl — autodescoberta de pods, cópia de arquivos em chunks, dumps de banco de dados e terminais com prompt colorido.
+Simplificador de operações com kubectl — gerenciamento de kubeconfigs, autodescoberta de pods, cópia de arquivos em chunks, dumps de banco de dados e terminais com prompt colorido.
 
 ## Instalação
 
@@ -28,13 +28,72 @@ echo 'autoload -U +X bashcompinit && bashcompinit' >> ~/.zshrc
 echo 'source /caminho/para/kbtool-completion.bash' >> ~/.zshrc
 ```
 
-## Uso
+## Gerenciamento de Clusters
+
+Os kubeconfigs são salvos em `~/.config/kbtool/clusters/<slug>.yaml`. O cluster ativo é por sessão de terminal (cada terminal pode usar um cluster diferente).
+
+### Comandos
+
+| Comando | Descrição |
+|---------|-----------|
+| `cluster add <slug>` | Adiciona kubeconfig interativamente |
+| `cluster rm <slug>` | Remove kubeconfig (pede confirmação) |
+| `cluster update <slug>` | Atualiza kubeconfig interativamente |
+| `cluster list` | Lista clusters cadastrados (`*` = ativo) |
+| `use <slug>` | Ativa cluster na sessão atual |
+| `use` | Mostra cluster ativo na sessão atual |
+
+### Fluxo
+
+```bash
+# 1. Adicionar cluster (pede para colar o kubeconfig)
+kbtool cluster add production
+# Paste the kubeconfig content, then press Ctrl-D to finish:
+<colar conteúdo do kubeconfig>
+^D
+✓ Cluster 'production' added successfully
+
+# 2. Ativar cluster na sessão
+kbtool use production
+✓ Now using cluster: production
+
+# 3. Usar comandos normalmente
+kbtool bash production api
+kbtool pgdump production db ./dump.sql
+
+# 4. Trocar de cluster em outro terminal
+kbtool use staging
+
+# 5. Listar clusters
+kbtool cluster list
+  * production
+    staging
+
+# 6. Atualizar kubeconfig
+kbtool cluster update production
+
+# 7. Remover cluster
+kbtool cluster rm production
+Remove cluster 'production'? [y/N] y
+✓ Cluster 'production' removed
+```
+
+### Validação
+
+Ao colar o kubeconfig, o kbtool verifica automaticamente se contém `apiVersion` e `kind: Config`. Conteúdo inválido é rejeitado.
+
+### Armazenamento
+
+| Caminho | Descrição |
+|---------|-----------|
+| `~/.config/kbtool/clusters/*.yaml` | Kubeconfigs salvos (chmod 600) |
+| `/tmp/kbtool_active_<tty>` | Cluster ativo por sessão de terminal |
+
+## Comandos de Pod
 
 ```
 kbtool <comando> <namespace> [args...]
 ```
-
-### Comandos
 
 | Comando | Descrição |
 |---------|-----------|
@@ -64,7 +123,7 @@ Se o pod tiver múltiplos containers, também será pedido para escolher.
 
 ### Copiar Arquivos
 
-Transferência em chunks de 5MB com validação de tamanho, retry automático (até 5 tentativas) e barra de progresso com ETA:
+Transferência em chunks com validação de tamanho, retry automático e barra de progresso com ETA:
 
 ```bash
 # Download (remoto → local)
@@ -98,7 +157,7 @@ kbtool psql production db
 O dump é feito em 3 etapas para evitar o erro `unexpected EOF` do `kubectl cp`:
 
 1. Dump + compressão (gzip) no pod
-2. Transferência em chunks de 5MB com validação e retry
+2. Transferência em chunks com validação e retry
 3. Remontagem local
 
 O formato de saída depende da extensão:
@@ -111,30 +170,6 @@ kbtool pgdump production db ./dump.sql
 kbtool mariadb_dump production db ./dump.sql.gz
 ```
 
-## Exemplos
-
-```bash
-# Shell no pod de API
-kbtool bash production api
-
-# Baixar log do pod
-kbtool cp production api:/var/log/app.log ./app.log
-
-# Console MySQL
-kbtool mysql production db
-
-# Dump PostgreSQL (descompactado)
-kbtool pgdump production db ./dump.sql
-
-# Dump MariaDB (compactado)
-kbtool mariadb_dump staging db ./dump.sql.gz
-```
-
-## Requisitos
-
-- `kubectl` configurado e com acesso ao cluster
-- Bash 3.2+
-
 ## Configuração
 
 | Opção | Env var | Default | Descrição |
@@ -145,12 +180,17 @@ kbtool mariadb_dump staging db ./dump.sql.gz
 As opções CLI podem ser passadas em qualquer posição:
 
 ```bash
-kbtool cp --chunk-size=10M production api:/big.sql ./big.sql
+kbtool cp --chunk-size=1M production api:/big.sql ./big.sql
 kbtool pgdump --retries=5 --chunk-size=5M production db ./dump.sql
 ```
 
 Ou via variável de ambiente:
 
 ```bash
-KBTOOL_CHUNK_SIZE=10M kbtool cp production api:/big.sql ./big.sql
+KBTOOL_CHUNK_SIZE=1M kbtool cp production api:/big.sql ./big.sql
 ```
+
+## Requisitos
+
+- `kubectl` configurado e com acesso ao cluster
+- Bash 3.2+

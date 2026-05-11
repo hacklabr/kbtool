@@ -717,6 +717,16 @@ cmd_bash() {
         -- env "PS1=[${namespace}:${pod_query} bash] " sh
 }
 
+cmd_logs() {
+    local namespace="$1" pod_query="$2"
+    shift 2
+    local pod container
+    pod=$(resolve_pod "$namespace" "$pod_query") || return 1
+    container=$(resolve_container "$namespace" "$pod") || return 1
+    log_info "Logs for ${pod} [${container}]"
+    kubectl logs "$pod" -n "$namespace" -c "$container" "$@"
+}
+
 cmd_db_console() {
     local namespace="$1" pod_query="$2" db_type="$3"
     local pod container
@@ -905,6 +915,7 @@ ${BOLD}Cluster Commands:${NC}
 ${BOLD}Pod Commands:${NC}
   cp <ns> <src> <dst>          Copy files (pod:/path <-> local)
   bash <ns> <pod>              Interactive shell in pod
+  logs <ns> <pod> [flags]      Show pod logs (accepts kubectl logs flags)
   mariadb <ns> <pod>           MariaDB console
   mysql <ns> <pod>             MySQL console
   psql <ns> <pod>              PostgreSQL console
@@ -1006,6 +1017,10 @@ main() {
                 bash|sh)
                     [[ $# -lt 1 ]] && { log_error "Usage: kbtool bash <ns> <pod>"; exit 1; }
                     cmd_bash "$namespace" "$1"
+                    ;;
+                logs)
+                    [[ $# -lt 1 ]] && { log_error "Usage: kbtool logs <ns> <pod> [kubectl logs flags]"; exit 1; }
+                    cmd_logs "$namespace" "$@"
                     ;;
                 mariadb|mysql)
                     [[ $# -lt 1 ]] && { log_error "Usage: kbtool ${command} <ns> <pod>"; exit 1; }

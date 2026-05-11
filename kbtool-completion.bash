@@ -1,7 +1,7 @@
 _kbtool_clusters_dir="${HOME}/.config/kbtool/clusters"
 _kbtool_cache_dir="${HOME}/.config/kbtool/cache"
 
-_kbtool_commands=(cp bash mariadb mysql psql pgdump mariadb_dump mysql_dump cluster config use)
+_kbtool_commands=(cp bash logs mariadb mysql psql pgdump mariadb_dump mysql_dump cluster config use)
 _kbtool_cluster_subcmds=(add rm update list)
 
 _kbtool_get_slugs() {
@@ -16,9 +16,9 @@ _kbtool_get_slugs() {
 }
 
 _kbtool_get_active_slug() {
-    local tty_slug
-    tty_slug=$(tty 2>/dev/null | tr '/' '_' | sed 's/^_//')
-    cat "/tmp/kbtool_active_${tty_slug}" 2>/dev/null
+    local sess
+    sess=$(tty 2>/dev/null | tr -c 'a-zA-Z0-9' '_') || return
+    cat "/tmp/kbtool_active${sess}" 2>/dev/null
 }
 
 _kbtool_get_ns() {
@@ -105,7 +105,7 @@ _kbtool_bash() {
                         COMPREPLY+=($(compgen -f -- "$cur"))
                     COMPREPLY+=("${pod_complete[@]}")
                     ;;
-                bash|mariadb|mysql|psql|pgdump|mariadb_dump|mysql_dump)
+                bash|logs|mariadb|mysql|psql|pgdump|mariadb_dump|mysql_dump)
                     COMPREPLY=($(_kbtool_match "$cur" $(_kbtool_get_pods "$subcommand")))
                     ;;
             esac
@@ -166,7 +166,7 @@ _kbtool_zsh() {
                     [[ ${#candidates[@]} -gt 0 ]] && compadd "${candidates[@]}"
                     _files
                     ;;
-                bash|mariadb|mysql|psql|pgdump|mariadb_dump|mysql_dump)
+                bash|logs|mariadb|mysql|psql|pgdump|mariadb_dump|mysql_dump)
                     candidates=($(_kbtool_match "$cur" $(_kbtool_get_pods "$subcmd")))
                     [[ ${#candidates[@]} -gt 0 ]] && compadd "${candidates[@]}"
                     ;;

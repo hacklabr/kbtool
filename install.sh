@@ -53,7 +53,7 @@ current_shell=$(detect_shell)
 case "$current_shell" in
     zsh)
         add_to_rc "${HOME}/.zshrc" "_kb_tty=\$(tty 2>/dev/null) && [[ \"\$_kb_tty\" == /dev/* ]] && rm -f \"/tmp/kbtool_active\$(echo \"\$_kb_tty\" | tr -c 'a-zA-Z0-9' '_')\""
-        add_to_rc "${HOME}/.zshrc" "autoload -Uz compinit && compinit"
+        add_to_rc "${HOME}/.zshrc" "autoload -Uz compinit && compinit -u"
         add_to_rc "${HOME}/.zshrc" "source ${COMPLETION}"
         ;;
     bash)

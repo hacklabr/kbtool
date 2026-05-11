@@ -105,7 +105,12 @@ _kb_config_set() {
 
 _kb_session_file() {
     local sess
-    sess=$(tty 2>/dev/null | tr -c 'a-zA-Z0-9' '_') || sess="_default"
+    sess=$(tty 2>/dev/null)
+    if [[ -n "$sess" ]] && [[ "$sess" == /dev/* ]]; then
+        sess=$(echo "$sess" | tr -c 'a-zA-Z0-9' '_')
+    else
+        sess="_default"
+    fi
     echo "/tmp/kbtool_active${sess}"
 }
 

@@ -17,8 +17,11 @@ _kbtool_get_slugs() {
 
 _kbtool_get_active_slug() {
     local sess
-    sess=$(tty 2>/dev/null | tr -c 'a-zA-Z0-9' '_') || return
-    cat "/tmp/kbtool_active${sess}" 2>/dev/null
+    sess=$(tty 2>/dev/null)
+    if [[ -n "$sess" ]] && [[ "$sess" == /dev/* ]]; then
+        sess=$(echo "$sess" | tr -c 'a-zA-Z0-9' '_')
+        cat "/tmp/kbtool_active${sess}" 2>/dev/null
+    fi
 }
 
 _kbtool_get_ns() {

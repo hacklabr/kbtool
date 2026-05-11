@@ -24,8 +24,16 @@ _kbtool_get_active_slug() {
 _kbtool_get_ns() {
     local slug
     slug=$(_kbtool_get_active_slug)
-    if [[ -n "$slug" ]] && [[ -f "${_kbtool_cache_dir}/${slug}.ns" ]]; then
-        cat "${_kbtool_cache_dir}/${slug}.ns" | tr '\n' ' '
+    if [[ -z "$slug" ]]; then
+        return
+    fi
+    local cache="${_kbtool_cache_dir}/${slug}.ns"
+    if [[ -f "$cache" ]]; then
+        cat "$cache" | tr '\n' ' '
+    else
+        local kc="${_kbtool_clusters_dir}/${slug}.yaml"
+        KUBECONFIG="$kc" kubectl get namespaces --request-timeout=5s \
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null
     fi
 }
 

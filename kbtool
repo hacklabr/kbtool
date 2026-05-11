@@ -724,6 +724,9 @@ cmd_logs() {
     pod=$(resolve_pod "$namespace" "$pod_query") || return 1
     container=$(resolve_container "$namespace" "$pod") || return 1
     log_info "Logs for ${pod} [${container}]"
+    if [[ $# -eq 0 ]]; then
+        set -- -f
+    fi
     kubectl logs "$pod" -n "$namespace" -c "$container" "$@"
 }
 

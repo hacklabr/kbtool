@@ -52,17 +52,20 @@ add_to_rc() {
 current_shell=$(detect_shell)
 case "$current_shell" in
     zsh)
-        add_to_rc "${HOME}/.zshrc" "_kb_tty=\$(tty 2>/dev/null); if [[ -n \"\$_kb_tty\" ]] && [[ \"\$_kb_tty\" == /dev/* ]]; then rm -f \"/tmp/kbtool_active\$(echo \"\$_kb_tty\" | tr -c 'a-zA-Z0-9' '_')\"; fi"
+        add_to_rc "${HOME}/.zshrc" "KBTOOL_SHELL=\$\$"
+        add_to_rc "${HOME}/.zshrc" "rm -f \"/tmp/kbtool_active_\${KBTOOL_SHELL}\""
         add_to_rc "${HOME}/.zshrc" "autoload -Uz compinit && compinit -u"
         add_to_rc "${HOME}/.zshrc" "source ${COMPLETION}"
         ;;
     bash)
-        add_to_rc "${HOME}/.bashrc" "_kb_tty=\$(tty 2>/dev/null); if [[ -n \"\$_kb_tty\" ]] && [[ \"\$_kb_tty\" == /dev/* ]]; then rm -f \"/tmp/kbtool_active\$(echo \"\$_kb_tty\" | tr -c 'a-zA-Z0-9' '_')\"; fi"
+        add_to_rc "${HOME}/.bashrc" "KBTOOL_SHELL=\$\$"
+        add_to_rc "${HOME}/.bashrc" "rm -f \"/tmp/kbtool_active_\${KBTOOL_SHELL}\""
         add_to_rc "${HOME}/.bashrc" "source ${COMPLETION}"
         ;;
     *)
         log_info "Shell '${current_shell}' not supported for autocomplete. Adding bash config."
-        add_to_rc "${HOME}/.bashrc" "_kb_tty=\$(tty 2>/dev/null); if [[ -n \"\$_kb_tty\" ]] && [[ \"\$_kb_tty\" == /dev/* ]]; then rm -f \"/tmp/kbtool_active\$(echo \"\$_kb_tty\" | tr -c 'a-zA-Z0-9' '_')\"; fi"
+        add_to_rc "${HOME}/.bashrc" "KBTOOL_SHELL=\$\$"
+        add_to_rc "${HOME}/.bashrc" "rm -f \"/tmp/kbtool_active_\${KBTOOL_SHELL}\""
         add_to_rc "${HOME}/.bashrc" "source ${COMPLETION}"
         ;;
 esac

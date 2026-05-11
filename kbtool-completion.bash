@@ -16,12 +16,13 @@ _kbtool_get_slugs() {
 }
 
 _kbtool_get_active_slug() {
-    local sess
-    sess=$(tty 2>/dev/null)
-    if [[ -n "$sess" ]] && [[ "$sess" == /dev/* ]]; then
-        sess=$(echo "$sess" | tr -c 'a-zA-Z0-9' '_')
-        cat "/tmp/kbtool_active${sess}" 2>/dev/null
+    local shell_id="${KBTOOL_SHELL:-$$}"
+    local slug
+    slug=$(cat "/tmp/kbtool_active_${shell_id}" 2>/dev/null)
+    if [[ -z "$slug" ]] && [[ -n "${KUBECONFIG:-}" ]]; then
+        slug=$(basename "${KUBECONFIG%.yaml}" 2>/dev/null)
     fi
+    echo "$slug"
 }
 
 _kbtool_get_ns() {
